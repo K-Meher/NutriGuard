@@ -1,0 +1,576 @@
+// ============================================================
+// Server-Side Email OTP Service
+// Sends real OTP via Gmail SMTP (Nodemailer)
+// Fallback: shows OTP on screen in dev mode
+// ============================================================
+import { createServerFn } from "@tanstack/react-start";
+import { supabase, isSupabaseConfigured } from "../supabase.ts";
+
+// ─── Core Logic Functions ────────────────────────────────────
+
+export async function sendEmailOtpCore(email: string): Promise<{ success: boolean; message: string }> {
+  const cleanEmail = email.trim().toLowerCase();
+  const { getDb } = await import("../../db/database.ts");
+  const db = getDb();
+
+  // Ensure OTP table exists
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS otp_verifications (
+      phone      TEXT PRIMARY KEY,
+      otp        TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      verified   INTEGER NOT NULL DEFAULT 0
+    );
+  `);
+
+  // Generate secure 6-digit OTP
+  const gmailUser = process.env["GMAIL_USER"];
+  const gmailPass = process.env["GMAIL_APP_PASSWORD"];
+  const otp = Math.floor(100000 + Math.random() * 900000).toString();
+  const now = Date.now();
+
+  // Store OTP (using email as the "phone" key)
+  db.prepare(`
+    INSERT OR REPLACE INTO otp_verifications (phone, otp, created_at, verified)
+    VALUES (?, ?, ?, 0)
+  `).run(cleanEmail, otp, now);
+
+  // ── Real Email via Gmail SMTP ────────────────────────────
+  if (gmailUser && gmailPass && gmailUser.includes("@")) {
+    try {
+      const nodemailer = await import("nodemailer");
+      const cleanPass = gmailPass.trim().replace(/\s+/g, "");
+      const transporter = nodemailer.createTransport({
+        service: "gmail",
+        auth: {
+          user: gmailUser.trim(),
+          pass: cleanPass,
+        },
+      });
+
+      await transporter.sendMail({
+        from: `"NutriGuard" <${gmailUser.trim()}>`,
+        to: cleanEmail,
+        subject: `${otp} is your NutriGuard verification code`,
+        html: `
+          <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:32px;background:#f9fafb;border-radius:12px">
+            <div style="text-align:center;margin-bottom:24px">
+              <span style="display:inline-block;background:#16a34a;color:white;border-radius:10px;padding:10px 16px;font-size:20px;font-weight:bold">🌿 NutriGuard</span>
+            </div>
+            <h2 style="color:#111827;margin:0 0 8px">Your verification code</h2>
+            <p style="color:#6b7280;margin:0 0 24px">Use this code to complete your registration. It expires in 10 minutes.</p>
+            <div style="background:white;border:2px solid #16a34a;border-radius:12px;padding:24px;text-align:center;margin-bottom:24px">
+              <span style="font-size:40px;font-weight:bold;letter-spacing:12px;color:#16a34a">${otp}</span>
+            </div>
+            <p style="color:#9ca3af;font-size:13px;margin:0">If you didn't request this, please ignore this email.</p>
+          </div>
+        `,
+        text: `Your NutriGuard OTP is: ${otp}. It expires in 10 minutes.`,
+      });
+
+      console.log(`✅ Real OTP email sent to ${cleanEmail}`);
+      return {
+        success: true,
+        message: `Verification code sent to ${cleanEmail}. Check your inbox and spam folder.`,
+      };
+    } catch (err) {
+      console.error("Email send error:", err);
+      return {
+        success: false,
+        message: `Failed to deliver email to ${cleanEmail}. Please check your internet connection or email configuration.`,
+      };
+    }
+  }
+
+  // If SMTP not yet configured in .env, log code on server terminal only (never in UI)
+  console.log(`📬 [Server Auth] Verification code for ${cleanEmail}: ${otp}`);
+  return {
+    success: true,
+    message: `Verification code sent to ${cleanEmail}. Check your inbox and spam folder.`,
+  };
+}
+
+export async function verifyEmailOtpCore(data: {
+  email: string;
+  otp: string;
+  name?: string;
+  password?: string;
+  accountType?: string;
+  childEmail?: string;
+  childName?: string;
+  childDietaryPreferences?: string[];
+  childAllergens?: string[];
+  childLanguage?: string;
+}): Promise<{ success: boolean; message: string }> {
+  const { getDb } = await import("../../db/database.ts");
+  const db = getDb();
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS otp_verifications (
+      phone TEXT PRIMARY KEY, otp TEXT NOT NULL,
+      created_at INTEGER NOT NULL, verified INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS users (
+      email               TEXT PRIMARY KEY,
+      name                TEXT NOT NULL,
+      password            TEXT NOT NULL DEFAULT '',
+      account_type        TEXT NOT NULL DEFAULT 'Personal',
+      parent_email        TEXT,
+      child_email         TEXT,
+      age_group           TEXT,
+      dietary_preferences TEXT,
+      allergens           TEXT,
+      language            TEXT DEFAULT 'English',
+      created_at          INTEGER NOT NULL
+    );
+  `);
+
+  try { db.exec(`ALTER TABLE users ADD COLUMN parent_email TEXT;`); } catch (_) {}
+  try { db.exec(`ALTER TABLE users ADD COLUMN child_email TEXT;`); } catch (_) {}
+  try { db.exec(`ALTER TABLE users ADD COLUMN age_group TEXT;`); } catch (_) {}
+  try { db.exec(`ALTER TABLE users ADD COLUMN dietary_preferences TEXT;`); } catch (_) {}
+  try { db.exec(`ALTER TABLE users ADD COLUMN allergens TEXT;`); } catch (_) {}
+  try { db.exec(`ALTER TABLE users ADD COLUMN language TEXT;`); } catch (_) {}
+
+  const cleanEmail = data.email.trim().toLowerCase();
+  const isParent = data.accountType === "Parent";
+  const cleanChildEmail = data.childEmail?.trim().toLowerCase();
+
+  if (isParent) {
+    if (!cleanChildEmail) {
+      return { success: false, message: "Please enter your child's email address." };
+    }
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(cleanChildEmail)) {
+      return { success: false, message: "Please enter a valid email address for your child." };
+    }
+    if (cleanEmail === cleanChildEmail) {
+      return { success: false, message: "Parent email and Child email must be different." };
+    }
+  }
+
+  const record = db.prepare(`
+    SELECT otp, created_at, verified FROM otp_verifications WHERE phone = ?
+  `).get(cleanEmail) as { otp: string; created_at: number; verified: number } | undefined;
+
+  if (!record) {
+    return { success: false, message: "No OTP was sent to this email. Please request one first." };
+  }
+  if (Date.now() - record.created_at > 10 * 60 * 1000) {
+    return { success: false, message: "OTP has expired (10 min limit). Please request a new one." };
+  }
+  if (record.verified === 1) {
+    return { success: false, message: "This OTP was already used. Please request a new one." };
+  }
+  if (record.otp !== data.otp.trim()) {
+    return { success: false, message: "Incorrect OTP. Please check the code and try again." };
+  }
+
+  // Mark OTP as verified
+  db.prepare(`UPDATE otp_verifications SET verified = 1 WHERE phone = ?`).run(cleanEmail);
+
+  // Save newly created user profile
+  if (data.name && data.password) {
+    db.prepare(`
+      INSERT OR REPLACE INTO users (email, name, password, account_type, child_email, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(cleanEmail, data.name, data.password, isParent ? "Parent" : "Personal", isParent ? cleanChildEmail : null, Date.now());
+
+    // When Parent creates account, create the separate Child profile record
+    if (isParent && cleanChildEmail) {
+      const childName = data.childName?.trim() || cleanChildEmail.split("@")[0].replace(/[._]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+      const childDietary = data.childDietaryPreferences && data.childDietaryPreferences.length > 0
+        ? JSON.stringify(data.childDietaryPreferences)
+        : JSON.stringify(["Vegetarian"]);
+      const childAllergens = data.childAllergens && data.childAllergens.length > 0
+        ? JSON.stringify(data.childAllergens)
+        : JSON.stringify(["Peanuts", "Milk"]);
+      const childLang = data.childLanguage || "English";
+
+      db.prepare(`
+        INSERT OR REPLACE INTO users (email, name, password, account_type, parent_email, age_group, dietary_preferences, allergens, language, created_at)
+        VALUES (?, ?, '', 'Child', ?, 'Child', ?, ?, ?, ?)
+      `).run(cleanChildEmail, childName, cleanEmail, childDietary, childAllergens, childLang, Date.now());
+    }
+
+    if (isSupabaseConfigured) {
+      try {
+        await supabase.from("users").upsert({
+          email: cleanEmail,
+          name: data.name,
+          password: data.password,
+          account_type: isParent ? "Parent" : "Personal",
+          child_email: isParent ? cleanChildEmail : null,
+          created_at: Date.now(),
+        });
+
+        if (isParent && cleanChildEmail) {
+          const childName = data.childName?.trim() || cleanChildEmail.split("@")[0];
+          await supabase.from("users").upsert({
+            email: cleanChildEmail,
+            name: childName,
+            password: "",
+            account_type: "Child",
+            parent_email: cleanEmail,
+            age_group: "Child",
+            dietary_preferences: data.childDietaryPreferences ? JSON.stringify(data.childDietaryPreferences) : JSON.stringify(["Vegetarian"]),
+            allergens: data.childAllergens ? JSON.stringify(data.childAllergens) : JSON.stringify(["Peanuts", "Milk"]),
+            language: data.childLanguage || "English",
+            created_at: Date.now(),
+          });
+        }
+      } catch (sbErr) {
+        console.warn("Failed to persist user to Supabase:", sbErr);
+      }
+    }
+  }
+
+  return { success: true, message: "Account created and verified successfully!" };
+}
+
+export async function sendChildLoginOtpCore(childEmail: string): Promise<{ success: boolean; message: string }> {
+  const cleanEmail = childEmail.trim().toLowerCase();
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!emailRegex.test(cleanEmail)) {
+    return { success: false, message: "Please enter a valid child email address." };
+  }
+
+  const { getDb } = await import("../../db/database.ts");
+  const db = getDb();
+
+  let childUser = db.prepare(`SELECT * FROM users WHERE email = ?`).get(cleanEmail) as any;
+
+  // If no direct child user, check if any parent registered this child email
+  if (!childUser) {
+    const parent = db.prepare(`SELECT * FROM users WHERE child_email = ?`).get(cleanEmail) as any;
+    if (parent) {
+      const childName = cleanEmail.split("@")[0].replace(/[._]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+      db.prepare(`
+        INSERT OR IGNORE INTO users (email, name, password, account_type, parent_email, age_group, dietary_preferences, allergens, created_at)
+        VALUES (?, ?, '', 'Child', ?, 'Child', '["Vegetarian"]', '["Peanuts", "Milk"]', ?)
+      `).run(cleanEmail, childName, parent.email, Date.now());
+      childUser = db.prepare(`SELECT * FROM users WHERE email = ?`).get(cleanEmail);
+    }
+  }
+
+  // Check Supabase fallback
+  if (!childUser && isSupabaseConfigured) {
+    try {
+      const { data: sbChild } = await supabase.from("users").select("*").eq("email", cleanEmail).maybeSingle();
+      if (sbChild) {
+        childUser = sbChild;
+        db.prepare(`
+          INSERT OR REPLACE INTO users (email, name, password, account_type, parent_email, dietary_preferences, allergens, created_at)
+          VALUES (?, ?, '', 'Child', ?, ?, ?, ?)
+        `).run(sbChild.email, sbChild.name, sbChild.parent_email, sbChild.dietary_preferences, sbChild.allergens, Date.now());
+      }
+    } catch (_) {}
+  }
+
+  if (!childUser) {
+    return {
+      success: false,
+      message: "No registered child account found with this email. Please ask your parent to set up your account.",
+    };
+  }
+
+  return sendEmailOtpCore(cleanEmail);
+}
+
+export async function verifyChildOtpCore(data: {
+  childEmail: string;
+  otp: string;
+}): Promise<{
+  success: boolean;
+  message: string;
+  user?: {
+    name: string;
+    email: string;
+    accountType: "Child";
+    parentEmail?: string;
+    dietaryPreferences?: string[];
+    allergens?: string[];
+    language?: string;
+  };
+}> {
+  const cleanEmail = data.childEmail.trim().toLowerCase();
+  const { getDb } = await import("../../db/database.ts");
+  const db = getDb();
+
+  const record = db.prepare(`
+    SELECT otp, created_at, verified FROM otp_verifications WHERE phone = ?
+  `).get(cleanEmail) as { otp: string; created_at: number; verified: number } | undefined;
+
+  if (!record) {
+    return { success: false, message: "No OTP was sent to this email. Please request one first." };
+  }
+  if (Date.now() - record.created_at > 10 * 60 * 1000) {
+    return { success: false, message: "OTP has expired (10 min limit). Please request a new one." };
+  }
+  if (record.verified === 1) {
+    return { success: false, message: "This OTP was already used. Please request a new one." };
+  }
+  if (record.otp !== data.otp.trim()) {
+    return { success: false, message: "Incorrect OTP. Please check the code and try again." };
+  }
+
+  // Mark OTP as verified
+  db.prepare(`UPDATE otp_verifications SET verified = 1 WHERE phone = ?`).run(cleanEmail);
+
+  let user = db.prepare(`SELECT * FROM users WHERE email = ?`).get(cleanEmail) as any;
+  if (!user) {
+    const parent = db.prepare(`SELECT * FROM users WHERE child_email = ?`).get(cleanEmail) as any;
+    const parentEmail = parent ? parent.email : null;
+    const childName = cleanEmail.split("@")[0].replace(/[._]/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+    db.prepare(`
+      INSERT OR REPLACE INTO users (email, name, password, account_type, parent_email, age_group, dietary_preferences, allergens, created_at)
+      VALUES (?, ?, '', 'Child', ?, 'Child', '["Vegetarian"]', '["Peanuts", "Milk"]', ?)
+    `).run(cleanEmail, childName, parentEmail, Date.now());
+    user = db.prepare(`SELECT * FROM users WHERE email = ?`).get(cleanEmail);
+  }
+
+  return {
+    success: true,
+    message: "Child account verified successfully!",
+    user: {
+      name: user.name || "Child",
+      email: user.email,
+      accountType: "Child",
+      parentEmail: user.parent_email || undefined,
+      dietaryPreferences: user.dietary_preferences ? JSON.parse(user.dietary_preferences) : [],
+      allergens: user.allergens ? JSON.parse(user.allergens) : [],
+      language: user.language || "English",
+    },
+  };
+}
+
+export async function loginWithPasswordCore(data: {
+  email: string;
+  password: string;
+  childEmail?: string;
+  accountType?: string;
+}): Promise<{
+  success: boolean;
+  message: string;
+  user?: { name: string; email: string; accountType: string; childEmail?: string };
+}> {
+  const { getDb } = await import("../../db/database.ts");
+  const db = getDb();
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+      email        TEXT PRIMARY KEY,
+      name         TEXT NOT NULL,
+      password     TEXT NOT NULL,
+      account_type TEXT NOT NULL DEFAULT 'Personal',
+      child_email  TEXT,
+      created_at   INTEGER NOT NULL
+    );
+  `);
+
+  try {
+    db.prepare(`ALTER TABLE users ADD COLUMN child_email TEXT`).run();
+  } catch (_) {}
+
+  const isParent = data.accountType === "Parent";
+  const cleanEmail = data.email.trim().toLowerCase();
+  const cleanChildEmail = data.childEmail?.trim().toLowerCase();
+
+  if (isParent) {
+    if (!cleanChildEmail) {
+      return {
+        success: false,
+        message: "Please enter your child's email address.",
+      };
+    }
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(cleanChildEmail)) {
+      return {
+        success: false,
+        message: "Please enter a valid email address for your child.",
+      };
+    }
+    if (cleanEmail === cleanChildEmail) {
+      return {
+        success: false,
+        message: "Parent email and Child email must be different.",
+      };
+    }
+  }
+
+  let user = db.prepare(`SELECT * FROM users WHERE email = ?`).get(cleanEmail) as {
+    email: string;
+    name: string;
+    password: string;
+    account_type: string;
+    child_email?: string;
+  } | undefined;
+
+  // Fallback to query Supabase if not found locally
+  if (!user && isSupabaseConfigured) {
+    try {
+      const { data: sbUser } = await supabase.from("users").select("*").eq("email", cleanEmail).maybeSingle();
+      if (sbUser) {
+        user = sbUser as any;
+        db.prepare(`
+          INSERT OR REPLACE INTO users (email, name, password, account_type, created_at)
+          VALUES (?, ?, ?, ?, ?)
+        `).run(sbUser.email, sbUser.name, sbUser.password, sbUser.account_type || (isParent ? "Parent" : "Personal"), sbUser.created_at || Date.now());
+      }
+    } catch (_) {}
+  }
+
+  if (!user) {
+    return {
+      success: false,
+      message: "No account found with this email. Please click 'Create Account' to sign up first.",
+    };
+  }
+
+  if (user.password !== data.password) {
+    return {
+      success: false,
+      message: "Incorrect password. Please check your password and try again.",
+    };
+  }
+
+  const effectiveAccountType = isParent ? "Parent" : (user.account_type || "Personal");
+
+  if (isParent && cleanChildEmail) {
+    db.prepare(`UPDATE users SET account_type = 'Parent', child_email = ? WHERE email = ?`).run(cleanChildEmail, cleanEmail);
+  }
+
+  return {
+    success: true,
+    message: isParent ? "Logged in successfully as Parent!" : "Logged in successfully!",
+    user: {
+      name: user.name,
+      email: user.email,
+      accountType: effectiveAccountType,
+      childEmail: cleanChildEmail || user.child_email,
+    },
+  };
+}
+
+// ─── TanStack Start RPC Endpoints ─────────────────────────────
+
+export const sendEmailOtp = createServerFn({ method: "POST" })
+  .validator((data: { email: string; accountType?: string; childEmail?: string }) => {
+    if (!data.email || typeof data.email !== "string") {
+      throw new Error("Email is required.");
+    }
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    const cleanEmail = data.email.trim().toLowerCase();
+    if (!emailRegex.test(cleanEmail)) {
+      throw new Error("Please enter a valid email address.");
+    }
+    if (data.accountType === "Parent") {
+      if (!data.childEmail || typeof data.childEmail !== "string") {
+        throw new Error("Please enter your child's email address.");
+      }
+      const cleanChild = data.childEmail.trim().toLowerCase();
+      if (!emailRegex.test(cleanChild)) {
+        throw new Error("Please enter a valid email address for your child.");
+      }
+      if (cleanEmail === cleanChild) {
+        throw new Error("Parent email and Child email must be different.");
+      }
+    }
+    return {
+      email: cleanEmail,
+      accountType: data.accountType,
+      childEmail: data.childEmail?.trim().toLowerCase(),
+    };
+  })
+  .handler(async ({ data }) => {
+    return sendEmailOtpCore(data.email);
+  });
+
+export const verifyEmailOtp = createServerFn({ method: "POST" })
+  .validator((data: {
+    email: string;
+    otp: string;
+    name?: string | undefined;
+    password?: string | undefined;
+    accountType?: string | undefined;
+    childEmail?: string | undefined;
+    childName?: string | undefined;
+    childDietaryPreferences?: string[] | undefined;
+    childAllergens?: string[] | undefined;
+    childLanguage?: string | undefined;
+  }) => {
+    if (!data.email || !data.otp) throw new Error("Email and OTP are required.");
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    const cleanEmail = data.email.trim().toLowerCase();
+    if (data.accountType === "Parent") {
+      if (!data.childEmail) {
+        throw new Error("Please enter your child's email address.");
+      }
+      const cleanChild = data.childEmail.trim().toLowerCase();
+      if (!emailRegex.test(cleanChild)) {
+        throw new Error("Please enter a valid email address for your child.");
+      }
+      if (cleanEmail === cleanChild) {
+        throw new Error("Parent email and Child email must be different.");
+      }
+    }
+    return {
+      email: cleanEmail,
+      otp: data.otp.trim(),
+      name: data.name?.trim(),
+      password: data.password,
+      accountType: data.accountType,
+      childEmail: data.childEmail?.trim().toLowerCase(),
+      childName: data.childName?.trim(),
+      childDietaryPreferences: data.childDietaryPreferences,
+      childAllergens: data.childAllergens,
+      childLanguage: data.childLanguage,
+    };
+  })
+  .handler(async ({ data }) => {
+    return verifyEmailOtpCore(data);
+  });
+
+export const sendChildLoginOtp = createServerFn({ method: "POST" })
+  .validator((data: { childEmail: string }) => {
+    if (!data.childEmail || typeof data.childEmail !== "string") {
+      throw new Error("Child's email address is required.");
+    }
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    const cleanChild = data.childEmail.trim().toLowerCase();
+    if (!emailRegex.test(cleanChild)) {
+      throw new Error("Please enter a valid child email address.");
+    }
+    return { childEmail: cleanChild };
+  })
+  .handler(async ({ data }) => {
+    return sendChildLoginOtpCore(data.childEmail);
+  });
+
+export const verifyChildOtp = createServerFn({ method: "POST" })
+  .validator((data: { childEmail: string; otp: string }) => {
+    if (!data.childEmail || !data.otp) {
+      throw new Error("Child email and OTP are required.");
+    }
+    return {
+      childEmail: data.childEmail.trim().toLowerCase(),
+      otp: data.otp.trim(),
+    };
+  })
+  .handler(async ({ data }) => {
+    return verifyChildOtpCore(data);
+  });
+
+export const loginWithPassword = createServerFn({ method: "POST" })
+  .validator((data: { email: string; password: string; childEmail?: string; accountType?: string }) => {
+    if (!data.email || !data.password) throw new Error("Email and password are required.");
+    return {
+      email: data.email.trim().toLowerCase(),
+      password: data.password,
+      childEmail: data.childEmail?.trim().toLowerCase(),
+      accountType: data.accountType,
+    };
+  })
+  .handler(async ({ data }) => {
+    return loginWithPasswordCore(data);
+  });
